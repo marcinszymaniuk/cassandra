@@ -35,7 +35,6 @@ import org.apache.cassandra.cql3.CFDefinition.Name.Kind;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.*;
@@ -1014,7 +1013,123 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
     private List<ByteBuffer> getRequestedBound(Bound b, List<ByteBuffer> variables) throws InvalidRequestException
     {
         assert isColumnRange();
+        if (isMixedOrderTuple()) {
+            return buildMultiBound(b, variables);
+        }
         return buildBound(b, cfDef.clusteringColumns(), columnRestrictions, isReversed, cfDef.getColumnNameBuilder(), variables);
+    }
+
+    private List<ByteBuffer> buildMultiBound(Bound b, List<ByteBuffer> options) throws InvalidRequestException {
+        Restriction.Slice r = (Restriction.Slice) columnRestrictions[0];
+        Relation.Type relType;
+        if (r.hasBound(Bound.START)) {
+            relType = r.isInclusive(Bound.START) ? Relation.Type.GTE : Relation.Type.GT;
+        } else {
+            relType = r.isInclusive(Bound.END) ? Relation.Type.LTE : Relation.Type.LT;
+        }
+        List<ByteBuffer> restrictionValues = getRestrictionValues(b, options, r);
+
+        Iterator<Name> columnIterator = cfDef.clusteringColumns().iterator();
+        List<Name> previousColumns = new ArrayList<>();
+
+        /** Build multiple restrictions  so we can properly describe not contiguous slices.
+         *  i.e (a,b,c)>=(1,1,1)
+         *     translates to three restrictions sets:
+         *     1: a=1 and b=1 and c>=1
+         *     2: a=1 and b>1
+         *     3: a>1
+         * */
+        List<List<Restriction>> newRestrictions = buildMultiRestrictions(previousColumns, columnIterator,
+                relType, restrictionValues);
+        List<ByteBuffer> allBounds = new ArrayList<>();
+        for (List<Restriction> restrictions : newRestrictions) {
+            Restriction[] restrictionsArray = restrictions.toArray(new Restriction[restrictions.size()]);
+            List<ByteBuffer> bounds = buildBound(b, cfDef.clusteringColumns(), restrictionsArray, isReversed,
+                    cfDef.getColumnNameBuilder(), options);
+            allBounds.addAll(bounds);
+        }
+        return allBounds;
+    }
+
+    private boolean isMixedOrderTuple() {
+        boolean isTuple = columnRestrictions.length > 0 &&
+                columnRestrictions[0] instanceof MultiColumnRestriction.Slice;
+        boolean hasAsc = false;
+        boolean hasDesc = false;
+        Iterator<Name> columnIterator = cfDef.clusteringColumns().iterator();
+        while (columnIterator.hasNext()) {
+            if (isReversedType(columnIterator.next())) {
+                hasDesc = true;
+            } else {
+                hasAsc = true;
+            }
+        }
+        boolean isMixedOrder = hasAsc && hasDesc;
+        return isTuple && isMixedOrder;
+    }
+
+    private List<List<Restriction>> buildMultiRestrictions(List<Name> previousColumns,
+                                                           Iterator<Name> columnIterator,
+                                                           Relation.Type relType,
+                                                           List<ByteBuffer> restrictionBuffers)
+            throws InvalidRequestException {
+        List<List<Restriction>> restrictions = new ArrayList<>();
+        if (restrictionBuffers.size() <= previousColumns.size()) {
+            return new ArrayList<>();
+        }
+        Name col = columnIterator.next();
+
+        //decide here which restriction is first. i.e.
+        //(a,b)>(0,0) may turns into [(a=0 b>0), a>0] or [a>0,(a=0 b>0)] depending on columns ordering
+        if (((relType == Relation.Type.GT || relType == Relation.Type.GTE) && isReversedType(col)) ||
+                ((relType == Relation.Type.LT || relType == Relation.Type.LTE) && !isReversedType(col))) {
+            boolean hasNext = restrictionBuffers.size() > previousColumns.size() + 1;
+            restrictions.add(buildPartialRestrictions(previousColumns, col, relType, restrictionBuffers, hasNext));
+            previousColumns.add(col);
+            restrictions.addAll(buildMultiRestrictions(previousColumns, columnIterator, relType, restrictionBuffers));
+        } else {
+            List<Name> tmpPrevCol = new ArrayList<>();
+            tmpPrevCol.addAll(previousColumns);
+            tmpPrevCol.add(col);
+            boolean hasNext = restrictionBuffers.size() > previousColumns.size() + 1;
+            restrictions.addAll(buildMultiRestrictions(tmpPrevCol, columnIterator, relType, restrictionBuffers));
+            restrictions.add(buildPartialRestrictions(previousColumns, col, relType, restrictionBuffers, hasNext));
+        }
+        return restrictions;
+    }
+
+    private List<Restriction> buildPartialRestrictions(List<Name> eqColumns, Name neqColumn, Relation.Type relType,
+                                                       List<ByteBuffer> restrictionValues, boolean hasNext)
+            throws InvalidRequestException {
+        List<Restriction> result = new ArrayList<>();
+        int index;
+        for (index = 0; index < eqColumns.size(); index++) {
+            SingleColumnRestriction.EQ eq =
+                    new SingleColumnRestriction.EQ(new Constants.Value(restrictionValues.get(index)), onToken);
+            result.add(eq);
+        }
+        SingleColumnRestriction.Slice s = new SingleColumnRestriction.Slice(onToken);
+        if (relType == Relation.Type.GTE || relType == Relation.Type.LTE) {
+            if (hasNext) {
+                relType = relType == Relation.Type.GTE ? Relation.Type.GT : Relation.Type.LT;
+            }
+        }
+        s.setBound(relType, new Constants.Value(restrictionValues.get(neqColumn.position)));
+        result.add(s);
+        return result;
+    }
+
+    private List<ByteBuffer> getRestrictionValues(Bound b, List<ByteBuffer> options, Restriction.Slice r) throws InvalidRequestException {
+        List<ByteBuffer> restrictionBuffers;
+        if (r.hasBound(b)) {
+            restrictionBuffers = ((MultiColumnRestriction.Slice) r).
+                    componentBounds(b, options);
+
+        } else {
+            restrictionBuffers = ((MultiColumnRestriction.Slice) r).
+                    componentBounds(Bound.reverse(b), options);
+        }
+        return restrictionBuffers;
     }
 
     public List<IndexExpression> getIndexExpressions(List<ByteBuffer> variables) throws InvalidRequestException

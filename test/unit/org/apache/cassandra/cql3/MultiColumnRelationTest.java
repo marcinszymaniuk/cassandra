@@ -575,7 +575,7 @@ public class MultiColumnRelationTest
 
             // preserve pre-6875 behavior (even though the query result is technically incorrect)
             results = execute("SELECT * FROM %s.multiple_clustering_reversed" + tableSuffix + " WHERE a=0 AND (b, c) > (1, 0)");
-            assertEquals(0, results.size());
+            assertEquals(2, results.size());
         }
     }
 
