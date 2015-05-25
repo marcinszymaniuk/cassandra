@@ -1033,11 +1033,217 @@ public class SelectStatement implements CQLStatement
     private List<Composite> getRequestedBound(Bound b, QueryOptions options) throws InvalidRequestException
     {
         assert isColumnRange();
+        if (isMixedOrderTuple()) {
+            return buildMultiBound(b, options);
+        }
         return buildBound(b, cfm.clusteringColumns(), columnRestrictions, isReversed, cfm.comparator, options);
     }
 
-    public List<IndexExpression> getValidatedIndexExpressions(QueryOptions options) throws InvalidRequestException
-    {
+    private boolean isMixedOrderTuple() {
+        boolean isTuple = columnRestrictions.length > 0 &&
+                columnRestrictions[0] instanceof MultiColumnRestriction.Slice;
+        boolean hasAsc = false;
+        boolean hasDesc = false;
+        Iterator<ColumnDefinition> columnIterator = cfm.clusteringColumns().iterator();
+        while (columnIterator.hasNext()) {
+            if (isReversedType(columnIterator.next())) {
+                hasDesc = true;
+            } else {
+                hasAsc = true;
+            }
+        }
+        boolean isMixedOrder = hasAsc && hasDesc;
+        return isTuple && isMixedOrder;
+    }
+
+    /** Build multiple restrictions  so we can properly describe not contiguous slices.
+     *
+     *  i.e (a,b,c)>=(1,1,1) translates to three restrictions sets:
+     *     1: a=1 and b=1 and c>=1
+     *     2: a=1 and b>1
+     *     3: a>1
+     * */
+    private List<Composite> buildMultiBound(Bound b, QueryOptions options) throws InvalidRequestException {
+
+        MultiColumnRestriction.Slice r = (MultiColumnRestriction.Slice) columnRestrictions[0];
+
+        List<List<Restriction>> newRestrictions = new ArrayList<>();
+        List<ByteBuffer> restrictionValuesStart = getRestrValues(Bound.START, options,r);
+        List<ByteBuffer> restrictionValuesEnd = getRestrValues(Bound.END, options, r);
+        Operator relTypeStart = getOperator(r, Bound.START);
+        Operator relTypeEnd = getOperator(r, Bound.END);
+        newRestrictions.addAll(getNewRestrictions(restrictionValuesStart, restrictionValuesEnd, relTypeStart, relTypeEnd));
+
+        List<Composite> allBounds = new ArrayList<>();
+
+        for (List<Restriction> restrictions : newRestrictions) {
+            Restriction[] restrictionsArray = restrictions.toArray(new Restriction[restrictions.size()]);
+            List<Composite> bounds = buildBound(b, cfm.clusteringColumns(), restrictionsArray, isReversed,
+                    cfm.comparator, options);
+            allBounds.addAll(bounds);
+        }
+        return allBounds;
+    }
+
+    private List<List<Restriction>> getNewRestrictions(List<ByteBuffer> restrictionValuesStart, List<ByteBuffer> restrictionValuesEnd,
+                                                       Operator relTypeStart, Operator relTypeEnd) throws InvalidRequestException {
+        List<List<Restriction>> newRestrictions = new ArrayList<>();
+
+        //Decide ordering of slices so it reflects table definition
+        if(isReversedType(cfm.clusteringColumns().get(0)))
+        {
+            newRestrictions.addAll(buidEqRestrictions(restrictionValuesEnd, relTypeEnd, 0, restrictionValuesStart, relTypeStart));
+            List<Restriction> restrictionBetween = getBetweenRestriction(restrictionValuesStart, restrictionValuesEnd, relTypeStart, relTypeEnd);
+            newRestrictions.add(restrictionBetween);
+            newRestrictions.addAll(buidEqRestrictions(restrictionValuesStart, relTypeStart, 0, restrictionValuesEnd,relTypeEnd));
+        } else {
+            newRestrictions.addAll(buidEqRestrictions(restrictionValuesStart, relTypeStart, 0, restrictionValuesEnd,relTypeEnd));
+            List<Restriction> restrictionBetween = getBetweenRestriction(restrictionValuesStart, restrictionValuesEnd, relTypeStart, relTypeEnd);
+            newRestrictions.add(restrictionBetween);
+            newRestrictions.addAll(buidEqRestrictions(restrictionValuesEnd, relTypeEnd, 0, restrictionValuesStart,relTypeStart));
+        }
+
+        return newRestrictions;
+    }
+
+    private List<Restriction> getBetweenRestriction(List<ByteBuffer> restrictionValuesStart, List<ByteBuffer> restrictionValuesEnd, Operator relTypeStart, Operator relTypeEnd) throws InvalidRequestException {
+        List<Restriction> restrictionBetween = new ArrayList<>();
+        SingleColumnRestriction.Slice sBetweend = new SingleColumnRestriction.Slice(onToken);
+        if (restrictionValuesStart.size() > 0) {
+            sBetweend.setBound(relTypeStart == Operator.GTE ? Operator.GT : relTypeStart, new Constants.Value(restrictionValuesStart.get(0)));
+        }
+        if (restrictionValuesEnd.size() > 0) {
+            sBetweend.setBound(relTypeEnd == Operator.LTE ? Operator.LT : relTypeEnd, new Constants.Value(restrictionValuesEnd.get(0)));
+        }
+        restrictionBetween.add(sBetweend);
+        return restrictionBetween;
+    }
+
+    private List<List<Restriction>> buidEqRestrictions(List<ByteBuffer> restrictionValues, Operator relType,
+                                                       int startIndex,
+                                                       List<ByteBuffer> oppositeOperatorRestrictions,
+                                                       Operator oppositeRelType)
+            throws InvalidRequestException {
+        List<List<Restriction>> restrictions = new ArrayList<>();
+        if (restrictionValues.size() == 1 && (relType.equals(Operator.GTE) || relType.equals(Operator.LTE))) {
+            List<Restriction> restriction = new ArrayList<>();
+            restriction.add(new SingleColumnRestriction.EQ(new Constants.Value(restrictionValues.get(0)), onToken));
+            restriction.add(null);
+            restrictions.add(restriction);
+            return restrictions;
+        }
+        if (restrictionValues.size() > 1 && restrictionValues.size()-startIndex>=2) {
+            Operator strictRelation = getStrictRestriction(relType);
+
+            List<Restriction> restriction = buildEqRestriction(restrictionValues, relType, startIndex, oppositeOperatorRestrictions, oppositeRelType, strictRelation);
+            if((isReversedType(cfm.clusteringColumns().get(startIndex+1)) && strictRelation.equals(Operator.GT))
+                    || (!isReversedType(cfm.clusteringColumns().get(startIndex+1)) && strictRelation.equals(Operator.LT))){
+                if(restriction!=null){
+                    restrictions.add(restriction);
+                }
+                restrictions.addAll(buidEqRestrictions(restrictionValues, relType, startIndex+1,
+                        oppositeOperatorRestrictions,oppositeRelType));
+            }
+            else{
+                restrictions.addAll(buidEqRestrictions(restrictionValues, relType, startIndex + 1,
+                        oppositeOperatorRestrictions,oppositeRelType));
+                if(restriction!=null)
+                {
+                    restrictions.add(restriction);
+                }
+            }
+        }
+        return restrictions;
+
+    }
+
+    /*
+    Build restriction containg EQ restriction for [0, startIndex] columns and NEQ restriction on startIndex+1 column
+     */
+    private List<Restriction> buildEqRestriction(List<ByteBuffer> restrictionValues, Operator relType, int startIndex,
+                                                 List<ByteBuffer> oppositeOperatorRestrictions, Operator oppositeRelType,
+                                                 Operator strictRelation) throws InvalidRequestException {
+        List<Restriction> restriction = new ArrayList<>();
+        for(int i=0; i<=startIndex;i++){
+            restriction.add(new SingleColumnRestriction.EQ(new Constants.Value(restrictionValues.get(i)), onToken));
+        }
+        Operator strictOppositeRelation = getStrictRestriction(oppositeRelType);
+
+        SingleColumnRestriction.Slice s =
+                sliceForRestriction(restrictionValues, relType, startIndex, strictRelation);
+
+        //all columns we want to build two sides restriction for, are equal so it ends up in empty restriction anyway
+        if (restrictionsAreEquals(restrictionValues, oppositeOperatorRestrictions, startIndex + 2)) {
+            restriction = null;
+        }
+        else if (oppositeOperatorRestrictions.size() <= startIndex + 1) {
+            // opposite relation doesn't include NEQ column so we add nothing related to a slice
+
+        } else if (restrictionsAreEquals(restrictionValues, oppositeOperatorRestrictions, startIndex + 1)) {
+            if (oppositeOperatorRestrictions.size() - startIndex == 2) {
+                s.setBound(oppositeRelType, new Constants.Value(oppositeOperatorRestrictions.get(startIndex + 1)));
+            } else {
+                s.setBound(strictOppositeRelation, new Constants.Value(oppositeOperatorRestrictions.get(startIndex + 1)));
+            }
+
+        }
+        if (restriction != null) {
+            restriction.add(s);
+        }
+        return restriction;
+    }
+
+    private boolean restrictionsAreEquals(List<ByteBuffer> restrictionValues, List<ByteBuffer> otherRestrictions,
+                                          int columnsToCheck) {
+        for(int i=0;i<columnsToCheck;i++){
+            if(otherRestrictions.size()<i+1){
+                return false;
+            }
+            if(!restrictionValues.get(i).equals(otherRestrictions.get(i))){
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private SingleColumnRestriction.Slice sliceForRestriction(List<ByteBuffer> restrictionValues, Operator relType,
+                                                              int startIndex, Operator strictRestriction)
+            throws InvalidRequestException {
+        SingleColumnRestriction.Slice s = new SingleColumnRestriction.Slice(onToken);
+        if(restrictionValues.size()-startIndex==2){
+            s.setBound(relType, new Constants.Value(restrictionValues.get(startIndex+1)));
+        }else {
+            s.setBound(strictRestriction, new Constants.Value(restrictionValues.get(startIndex+1)));
+        }
+        return s;
+    }
+
+    private Operator getStrictRestriction(Operator relType) {
+        switch (relType){
+            case LTE:
+                return Operator.LT;
+            case GTE:
+                return Operator.GT;
+            default:
+                return relType;
+        }
+    }
+
+    private List<ByteBuffer> getRestrValues(Bound b, QueryOptions options, MultiColumnRestriction.Slice r) throws InvalidRequestException {
+        if (r.hasBound(b)) {
+            return r.componentBounds(b, options);
+        }
+        return new ArrayList<>();
+    }
+
+    private Operator getOperator(Restriction.Slice r, Bound bound) {
+        if (bound == Bound.START)
+            return r.isInclusive(bound) ? Operator.GTE : Operator.GT;
+        else
+            return r.isInclusive(bound) ? Operator.LTE : Operator.LT;
+    }
+
+    public List<IndexExpression> getValidatedIndexExpressions(QueryOptions options) throws InvalidRequestException {
         if (!usesSecondaryIndexing || restrictedColumns.isEmpty())
             return Collections.emptyList();
 
@@ -1122,7 +1328,7 @@ public class SelectStatement implements CQLStatement
             SecondaryIndexManager secondaryIndexManager = cfs.indexManager;
             secondaryIndexManager.validateIndexSearchersForQuery(expressions);
         }
-        
+
         return expressions;
     }
 
@@ -2079,7 +2285,7 @@ public class SelectStatement implements CQLStatement
             // the static parts. But 1) we don't have an easy way to do that with 2i and 2) since we don't support index on static columns
             // so far, 2i means that you've restricted a non static column, so the query is somewhat non-sensical.
             if (stmt.selectsOnlyStaticColumns)
-                throw new InvalidRequestException("Queries using 2ndary indexes don't support selecting only static columns");            
+                throw new InvalidRequestException("Queries using 2ndary indexes don't support selecting only static columns");
         }
 
         private void verifyOrderingIsAllowed(SelectStatement stmt) throws InvalidRequestException

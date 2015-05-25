@@ -148,10 +148,6 @@ public class ColumnSlice
             }
             else
             {
-                // !finish.isEmpty() is imposed by prior loop
-                if (i > 0 && comparator.compare(slices[i - 1].finish, start) >= 0)
-                    return false;
-
                 if (comparator.compare(start, finish) > 0)
                     return false;
             }
